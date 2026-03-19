@@ -13,6 +13,8 @@ from src.core.config import CoreConfig
 class CorpusDoc:
     path: str
     text: str
+    source_corpus_id: int | None = None
+    source_doc_id: int | None = None
 
 
 def iter_corpus_files(corpus_dir: str, cfg: CoreConfig) -> Iterable[Path]:

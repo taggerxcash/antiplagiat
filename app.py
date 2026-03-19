@@ -2,10 +2,24 @@ import streamlit as st
 import pandas as pd
 import time
 import tempfile
+import json
 from pathlib import Path
+from uuid import uuid4
 
 from src.utils import extract_text
 from src.core.pipeline import run_full_stage
+from src.storage.management import (
+    ChangeSourceCorpusStateCommand,
+    DisableSourceCorpusCommand,
+    EnableSourceCorpusCommand,
+    InvalidSourceCorpusStateTransitionError,
+    SourceCorpusDisabledError,
+    SourceCorpusManagementService,
+    SourceCorpusNotFoundError,
+    UpdateSourceCorpusParametersCommand,
+)
+from src.storage.models import SourceCorpus, SourceCorpusState
+from src.storage.repository import SourceCorpusRepository
 
 
 try:
@@ -28,6 +42,236 @@ def render_progress(stage: int, placeholder):
         st.subheader("📊 Ход проверки")
         st.progress(progress)
         st.caption(labels.get(stage, f"{stage}/5"))
+
+
+@st.cache_resource
+def get_source_corpus_repo() -> SourceCorpusRepository | None:
+    try:
+        return SourceCorpusRepository()
+    except Exception:
+        return None
+
+
+@st.cache_resource
+def get_source_corpus_management_service() -> SourceCorpusManagementService | None:
+    repo = get_source_corpus_repo()
+    if repo is None:
+        return None
+    return SourceCorpusManagementService(repository=repo)
+
+
+def _parse_json_dict(raw: str, field_name: str) -> dict:
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{field_name}: некорректный JSON ({exc})") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"{field_name}: ожидается JSON-объект.")
+    return data
+
+
+def _format_corpus_label(corpus: SourceCorpus) -> str:
+    status_icon = "🟢" if corpus.is_enabled else "⚪"
+    return f"{status_icon} {corpus.name} [{corpus.state.value}] ({corpus.external_id[:8]})"
+
+
+def _show_management_error(exc: Exception) -> None:
+    if isinstance(exc, SourceCorpusNotFoundError):
+        st.error("Корпус не найден.")
+    elif isinstance(exc, (InvalidSourceCorpusStateTransitionError, SourceCorpusDisabledError)):
+        st.error(str(exc))
+    else:
+        st.error(f"Ошибка выполнения команды: {exc}")
+
+
+def render_source_corpus_management_ui() -> None:
+    st.markdown("---")
+    st.header("🗂️ Управление корпусом источника (демо)")
+
+    repo = get_source_corpus_repo()
+    service = get_source_corpus_management_service()
+
+    if repo is None or service is None:
+        st.warning("Хранилище корпусов недоступно. Проверьте доступ к SQLite-файлу.")
+        return
+
+    corpora = repo.list_corpora(limit=200, offset=0)
+
+    if corpora:
+        rows = []
+        for c in corpora:
+            rows.append(
+                {
+                    "Корпус": c.name,
+                    "External ID": c.external_id,
+                    "Состояние": c.state.value,
+                    "Включен": "Да" if c.is_enabled else "Нет",
+                    "Документов": c.total_docs,
+                    "Индексировано": c.indexed_docs,
+                    "Ошибок": c.failed_docs,
+                    "Обновлён": c.updated_at,
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    else:
+        st.info("Пока нет корпусов. Создайте первый корпус через форму ниже.")
+
+    col_create, col_manage = st.columns([1, 1.2])
+
+    with col_create:
+        st.subheader("Создание корпуса")
+        with st.form("create_source_corpus_form"):
+            create_name = st.text_input("Название", value="Новый корпус")
+            create_root = st.text_input("Путь к папке корпуса", value="src/data/corpus")
+            create_external_id = st.text_input("External ID (опционально)", value="").strip()
+            create_state = st.selectbox(
+                "Начальное состояние",
+                options=[s.value for s in SourceCorpusState],
+                index=0,
+            )
+            create_enabled = st.checkbox("Корпус включен", value=True)
+            create_params_raw = st.text_area(
+                "Параметры (JSON)",
+                value='{"language": "ru", "min_similarity": 0.7}',
+                height=140,
+            )
+            create_submitted = st.form_submit_button("Создать корпус", type="primary")
+
+            if create_submitted:
+                try:
+                    params = _parse_json_dict(create_params_raw, "Параметры")
+                    created = repo.create_corpus(
+                        SourceCorpus(
+                            name=create_name.strip() or "Новый корпус",
+                            root_path=create_root.strip() or "src/data/corpus",
+                            parameters=params,
+                            is_enabled=create_enabled,
+                            state=SourceCorpusState(create_state),
+                            external_id=create_external_id or str(uuid4()),
+                        )
+                    )
+                except Exception as exc:
+                    st.error(f"Не удалось создать корпус: {exc}")
+                else:
+                    st.success(f"Корпус создан: {created.name} ({created.external_id})")
+                    st.rerun()
+
+    with col_manage:
+        st.subheader("Управление существующим корпусом")
+        if not corpora:
+            st.caption("После создания корпуса здесь появятся элементы управления.")
+            return
+
+        corpus_by_id = {c.external_id: c for c in corpora}
+        selected_external_id = st.selectbox(
+            "Выберите корпус",
+            options=list(corpus_by_id.keys()),
+            format_func=lambda eid: _format_corpus_label(corpus_by_id[eid]),
+        )
+        selected = corpus_by_id[selected_external_id]
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Состояние", selected.state.value)
+        m2.metric("Включен", "Да" if selected.is_enabled else "Нет")
+        m3.metric("Индексировано", f"{selected.indexed_docs}/{selected.total_docs}")
+        m4.metric("Ошибок", str(selected.failed_docs))
+
+        st.caption(f"Путь: {selected.root_path}")
+        st.caption(f"Обновлён: {selected.updated_at or '-'} | Индексирован: {selected.indexed_at or '-'}")
+        if selected.last_error:
+            st.warning(f"Последняя ошибка: {selected.last_error}")
+
+        st.markdown("**Текущие параметры корпуса**")
+        st.code(json.dumps(selected.parameters, ensure_ascii=False, indent=2), language="json")
+
+        with st.form("toggle_corpus_form"):
+            toggle_reason = st.text_input("Причина (опционально)", value="")
+            t1, t2 = st.columns(2)
+            enable_submitted = t1.form_submit_button("Включить")
+            disable_submitted = t2.form_submit_button("Выключить")
+
+            if enable_submitted:
+                try:
+                    service.enable(
+                        EnableSourceCorpusCommand(
+                            external_id=selected_external_id,
+                            reason=toggle_reason.strip() or None,
+                        )
+                    )
+                except Exception as exc:
+                    _show_management_error(exc)
+                else:
+                    st.success("Корпус включен.")
+                    st.rerun()
+
+            if disable_submitted:
+                try:
+                    service.disable(
+                        DisableSourceCorpusCommand(
+                            external_id=selected_external_id,
+                            reason=toggle_reason.strip() or None,
+                        )
+                    )
+                except Exception as exc:
+                    _show_management_error(exc)
+                else:
+                    st.success("Корпус выключен.")
+                    st.rerun()
+
+        with st.form("change_state_form"):
+            target_state = st.selectbox(
+                "Новое состояние",
+                options=[s.value for s in SourceCorpusState],
+                index=[s.value for s in SourceCorpusState].index(selected.state.value),
+            )
+            state_reason = st.text_input("Причина смены состояния", value="")
+            state_force = st.checkbox("Принудительно (force)", value=False)
+            state_submitted = st.form_submit_button("Изменить состояние")
+
+            if state_submitted:
+                try:
+                    service.change_state(
+                        ChangeSourceCorpusStateCommand(
+                            external_id=selected_external_id,
+                            target_state=SourceCorpusState(target_state),
+                            reason=state_reason.strip() or None,
+                            force=state_force,
+                        )
+                    )
+                except Exception as exc:
+                    _show_management_error(exc)
+                else:
+                    st.success("Состояние корпуса обновлено.")
+                    st.rerun()
+
+        with st.form("update_params_form"):
+            params_raw = st.text_area(
+                "Новые параметры (JSON)",
+                value=json.dumps(selected.parameters, ensure_ascii=False, indent=2),
+                height=180,
+            )
+            p1, p2 = st.columns(2)
+            merge_params = p1.checkbox("Сливать с текущими (merge)", value=True)
+            force_params = p2.checkbox("Принудительно (force)", value=False)
+            params_submitted = st.form_submit_button("Применить параметры")
+
+            if params_submitted:
+                try:
+                    payload = _parse_json_dict(params_raw, "Параметры")
+                    service.update_parameters(
+                        UpdateSourceCorpusParametersCommand(
+                            external_id=selected_external_id,
+                            parameters=payload,
+                            merge=merge_params,
+                            force=force_params,
+                        )
+                    )
+                except Exception as exc:
+                    _show_management_error(exc)
+                else:
+                    st.success("Параметры корпуса обновлены.")
+                    st.rerun()
 
 
 def main():
@@ -128,7 +372,11 @@ def main():
             time.sleep(0.25)
 
             render_progress(3, progress_placeholder)
-            report = run_full_stage(query_raw_text, corpus_dir)
+            report = run_full_stage(
+                query_raw_text,
+                corpus_dir,
+                corpus_repo=get_source_corpus_repo(),
+            )
             st.session_state["last_report"] = report
 
             time.sleep(0.15)
@@ -154,6 +402,8 @@ def main():
     - Проверяется текстовое сходство документов
     - Результаты включают процент сходства и найденные фрагменты
     """)
+
+    render_source_corpus_management_ui()
 
 def show_placeholder_results():
     """Заглушка для отображения результатов"""

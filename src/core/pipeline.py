@@ -11,7 +11,35 @@ from src.core.exact_match import exact_compare
 from src.core.exact_pairs import build_block_pairs
 
 
-def run_fast_stage(query_raw_text: str, corpus_dir: str, cfg: CoreConfig | None = None) -> dict[str, Any]:
+def _sync_source_corpus_repo(
+    corpus_repo: Any | None,
+    corpus_dir: str,
+    cfg: CoreConfig,
+    corpus_docs: list,
+    corpus_external_id: str | None,
+) -> None:
+    if corpus_repo is None:
+        return
+
+    sync_method = getattr(corpus_repo, "upsert_from_loaded_corpus", None)
+    if sync_method is None:
+        raise TypeError("corpus_repo must implement upsert_from_loaded_corpus(...).")
+
+    sync_method(
+        corpus_dir=corpus_dir,
+        cfg=cfg,
+        docs=corpus_docs,
+        external_id=corpus_external_id,
+    )
+
+
+def run_fast_stage(
+    query_raw_text: str,
+    corpus_dir: str,
+    cfg: CoreConfig | None = None,
+    corpus_repo: Any | None = None,
+    corpus_external_id: str | None = None,
+) -> dict[str, Any]:
     """
     MVP-выход для UI: список top-k кандидатов и метаданные.
     """
@@ -19,6 +47,7 @@ def run_fast_stage(query_raw_text: str, corpus_dir: str, cfg: CoreConfig | None 
 
     query_text = normalize_text(query_raw_text)
     corpus_docs = load_corpus(corpus_dir, cfg)
+    _sync_source_corpus_repo(corpus_repo, corpus_dir, cfg, corpus_docs, corpus_external_id)
 
     candidates = fast_top_k(query_text, corpus_docs, cfg)
 
@@ -29,7 +58,13 @@ def run_fast_stage(query_raw_text: str, corpus_dir: str, cfg: CoreConfig | None 
         "candidates": [asdict(c) for c in candidates],
     }
 
-def run_full_stage(query_raw_text: str, corpus_dir: str, cfg: CoreConfig | None = None) -> dict:
+def run_full_stage(
+    query_raw_text: str,
+    corpus_dir: str,
+    cfg: CoreConfig | None = None,
+    corpus_repo: Any | None = None,
+    corpus_external_id: str | None = None,
+) -> dict:
     """
     Полный MVP: fast top-k -> exact compare -> агрегированный отчёт.
     """
@@ -37,6 +72,7 @@ def run_full_stage(query_raw_text: str, corpus_dir: str, cfg: CoreConfig | None 
 
     query_text = normalize_text(query_raw_text)
     corpus_docs = load_corpus(corpus_dir, cfg)
+    _sync_source_corpus_repo(corpus_repo, corpus_dir, cfg, corpus_docs, corpus_external_id)
 
     candidates_fast = fast_top_k(query_text, corpus_docs, cfg)
 
