@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any, Protocol, Sequence, TYPE_CHECKING
+from typing import Any, Iterator, Protocol, Sequence, TYPE_CHECKING
 from uuid import NAMESPACE_URL, uuid5
 
 from src.core.config import CoreConfig
@@ -485,11 +486,19 @@ class SourceCorpusRepository:
                 ),
             )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     @staticmethod
     def _build_corpus_external_id(corpus_root: str) -> str:
